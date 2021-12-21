@@ -134,6 +134,8 @@
 /* buffer util macros */
 #define CPKT_BUF_WRITE(cpkt)	(cpkt)->data, &(cpkt)->offset, (cpkt)->max_len
 #define CPKT_BUF_READ(cpkt)	(cpkt)->data, (cpkt)->max_len
+#define CPKT_BUF_PTR(cpkt)	((cpkt)->data + (cpkt)->offset)
+#define CPKT_BUF_SIZE(cpkt)	((cpkt)->max_len - (cpkt)->offset)
 
 struct lwm2m_engine_obj;
 struct lwm2m_message;
@@ -411,6 +413,15 @@ struct lwm2m_block_context {
 	uint8_t token[8];
 	uint8_t tkl;
 	bool last_block : 1;
+#if defined(CONFIG_LWM2M_RW_SENML_JSON_SUPPORT)
+	bool base_name_stored : 1;
+	bool full_name_true : 1;
+	uint8_t base64_buf_len : 2;
+	uint8_t base64_mod_buf[3];
+	uint8_t json_flags;
+	struct lwm2m_obj_path base_name_path;
+	uint8_t resource_path_level;
+#endif
 	uint16_t res_id;
 };
 

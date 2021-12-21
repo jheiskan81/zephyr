@@ -23,6 +23,7 @@
 #define LWM2M_FORMAT_APP_OCTET_STREAM	42
 #define LWM2M_FORMAT_APP_EXI		47
 #define LWM2M_FORMAT_APP_JSON		50
+#define LWM2M_FORMAT_APP_SEML_JSON	110
 #define LWM2M_FORMAT_OMA_PLAIN_TEXT	1541
 #define LWM2M_FORMAT_OMA_OLD_TLV	1542
 #define LWM2M_FORMAT_OMA_OLD_JSON	1543
@@ -97,6 +98,8 @@ int lwm2m_send_empty_ack(struct lwm2m_ctx *client_ctx, uint16_t mid);
 int lwm2m_register_payload_handler(struct lwm2m_message *msg);
 
 int lwm2m_perform_read_op(struct lwm2m_message *msg, uint16_t content_format);
+
+int lwm2m_perform_composite_read_op(struct lwm2m_message *msg, uint16_t content_format, struct lwm2m_obj_path path_list[], uint8_t path_list_size);
 
 int lwm2m_write_handler(struct lwm2m_engine_obj_inst *obj_inst,
 			struct lwm2m_engine_res *res,

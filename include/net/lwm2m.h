@@ -1004,5 +1004,20 @@ void lwm2m_rd_client_stop(struct lwm2m_ctx *client_ctx,
  */
 void lwm2m_rd_client_update(void);
 
+/**
+ * 
+ * @brief LwM2M SEND operation to given path list
+ *
+ * @param ctx LwM2M context
+ * @param content_format 110 for SenML Json format or 112 for SenML CBOR
+ * @param path_list Path list for triggered Resources
+ * @param path_list_size Length of path list. Max size is defined by CONFIG_LWM2M_COMPOSITE_READ_MAX_URL
+ *
+ * 
+ * @return 0 for success or negative in case of error.
+ *
+ */
+int lwm2m_engine_send(struct lwm2m_ctx *ctx, uint16_t content_format, char *path_list[], uint8_t path_list_size);
+
 #endif	/* ZEPHYR_INCLUDE_NET_LWM2M_H_ */
 /**@}  */
