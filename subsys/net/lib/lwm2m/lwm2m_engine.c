@@ -81,6 +81,9 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #define QUEUE_OPT_MAX_LEN	2 /* "Q" */
 #define MAX_TOKEN_LEN		8
 
+static k_tid_t engine_thread_id;
+static bool suspend_engine_thread = false;
+
 struct observe_node {
 	sys_snode_t node;
 	sys_slist_t path_list;		/* List of Observation path */
@@ -179,6 +182,9 @@ static int do_composite_observe_read_path_op(struct lwm2m_message *msg, uint16_t
 static void lwm2m_engine_free_list(sys_slist_t *path_list, sys_slist_t *free_list);
 static int do_composite_read_op_for_parsed_list(struct lwm2m_message *msg, uint16_t content_format,
 						sys_slist_t *path_list);
+
+
+static void lwm2m_socket_update(struct lwm2m_ctx *ctx);
 
 /* for debugging: to print IP addresses */
 char *lwm2m_sprint_ip_addr(const struct sockaddr *addr)
@@ -1450,28 +1456,104 @@ cleanup:
 	return r;
 }
 
-#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
-int lwm2m_engine_connection_resume(struct lwm2m_ctx *client_ctx)
+int lwm2m_open_socket(struct lwm2m_ctx *client_ctx)
 {
-#ifdef CONFIG_LWM2M_DTLS_SUPPORT
-	if (!client_ctx->use_dtls) {
-		return 0;
+	if (client_ctx->sock_fd < 0) {
+		/* open socket */
+#if defined(CONFIG_LWM2M_DTLS_SUPPORT)
+		if (client_ctx->use_dtls) {
+			client_ctx->sock_fd = socket(client_ctx->remote_addr.sa_family, SOCK_DGRAM,
+						     IPPROTO_DTLS_1_2);
+		} else
+#endif /* CONFIG_LWM2M_DTLS_SUPPORT */
+		{
+			client_ctx->sock_fd =
+				socket(client_ctx->remote_addr.sa_family, SOCK_DGRAM, IPPROTO_UDP);
+		}
+
+		if (client_ctx->sock_fd < 0) {
+			LOG_ERR("Failed to create socket: %d", errno);
+			return -errno;
+		}
+		
+		lwm2m_socket_update(client_ctx);		
+	}
+	
+	return 0;
+}
+
+int lwm2m_close_socket(struct lwm2m_ctx *client_ctx)
+{
+	int ret = 0;
+
+	if (client_ctx->sock_fd >= 0) {
+		ret = close(client_ctx->sock_fd);
+		if (ret) {
+			LOG_ERR("Failed to close socket: %d", errno);
+			ret = -errno;
+			return ret;
+		}
+
+		client_ctx->sock_fd = -1;
+		client_ctx->connection_suspended = true;
+#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
+		/* Enable Queue mode buffer store */
+		client_ctx->buffer_client_messages = true;
+#endif
+		lwm2m_socket_update(client_ctx);
 	}
 
+	return ret;
+}
+
+int lwm2m_socket_suspend(struct lwm2m_ctx *client_ctx)
+{
+	int ret = 0;
+
+	if (client_ctx->sock_fd >= 0 && !client_ctx->connection_suspended) {
+		int socket_temp_id = client_ctx->sock_fd;
+
+		client_ctx->sock_fd = -1;
+		client_ctx->connection_suspended = true;
+#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
+		/* Enable Queue mode buffer store */
+		client_ctx->buffer_client_messages = true;
+#endif
+		lwm2m_socket_update(client_ctx);
+		client_ctx->sock_fd = socket_temp_id;
+	}
+	
+	return ret;
+}
+
+int lwm2m_engine_connection_resume(struct lwm2m_ctx *client_ctx)
+{
+	int ret;
+
 	if (client_ctx->connection_suspended) {
+		lwm2m_close_socket(client_ctx);
 		client_ctx->connection_suspended = false;
+		ret = lwm2m_open_socket(client_ctx);
+		if (ret) {
+			return ret;
+		}
+
+		if (!client_ctx->use_dtls) {
+			return 0;
+		}
+
 		LOG_DBG("Resume suspended connection");
 		return lwm2m_socket_start(client_ctx);
 	}
-#endif
+
 	return 0;
 }
-#endif
 
 
-#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
+
 int lwm2m_push_queued_buffers(struct lwm2m_ctx *client_ctx)
 {
+	#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
 	client_ctx->buffer_client_messages = false;
 	while (!sys_slist_is_empty(&client_ctx->queued_messages)) {
 		sys_snode_t *msg_node = sys_slist_get(&client_ctx->queued_messages);
@@ -1483,9 +1565,10 @@ int lwm2m_push_queued_buffers(struct lwm2m_ctx *client_ctx)
 		msg = SYS_SLIST_CONTAINER(msg_node, msg, node);
 		sys_slist_append(&msg->ctx->pending_sends, &msg->node);
 	}
+	#endif
 	return 0;
 }
-#endif
+
 
 int lwm2m_send_message_async(struct lwm2m_message *msg)
 {
@@ -5559,44 +5642,6 @@ static int32_t lwm2m_engine_service(const int64_t timestamp)
 					      timestamp);
 }
 
-#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
-
-int lwm2m_engine_close_socket_connection(struct lwm2m_ctx *client_ctx)
-{
-	int ret = 0;
-	/* Enable Queue mode buffer store */
-	client_ctx->buffer_client_messages = true;
-
-#ifdef CONFIG_LWM2M_DTLS_SUPPORT
-	if (!client_ctx->use_dtls) {
-		return 0;
-	}
-
-	if (client_ctx->sock_fd >= 0) {
-		ret = close(client_ctx->sock_fd);
-		if (ret) {
-			LOG_ERR("Failed to close socket: %d", errno);
-			ret = -errno;
-			return ret;
-		}
-		client_ctx->sock_fd = -1;
-		client_ctx->connection_suspended = true;
-	}
-
-	/* Open socket again that Observation and re-send functionality works */
-	client_ctx->sock_fd =
-		socket(client_ctx->remote_addr.sa_family, SOCK_DGRAM, IPPROTO_DTLS_1_2);
-
-	if (client_ctx->sock_fd < 0) {
-		LOG_ERR("Failed to create socket: %d", errno);
-		return -errno;
-	}
-#endif
-
-	return ret;
-}
-#endif
-
 int lwm2m_engine_context_close(struct lwm2m_ctx *client_ctx)
 {
 	int sock_fd = client_ctx->sock_fd;
@@ -5623,8 +5668,8 @@ int lwm2m_engine_context_close(struct lwm2m_ctx *client_ctx)
 	coap_replies_clear(client_ctx->replies,
 			   ARRAY_SIZE(client_ctx->replies));
 
-#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
 	client_ctx->connection_suspended = false;
+#if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
 	client_ctx->buffer_client_messages = true;
 #endif
 	lwm2m_socket_del(client_ctx);
@@ -5640,9 +5685,9 @@ void lwm2m_engine_context_init(struct lwm2m_ctx *client_ctx)
 {
 	sys_slist_init(&client_ctx->pending_sends);
 	sys_slist_init(&client_ctx->observer);
+	client_ctx->connection_suspended = false;
 #if defined(CONFIG_LWM2M_QUEUE_MODE_ENABLED)
 	client_ctx->buffer_client_messages = true;
-	client_ctx->connection_suspended = false;
 	sys_slist_init(&client_ctx->queued_messages);
 #endif
 }
@@ -5661,6 +5706,18 @@ int lwm2m_socket_add(struct lwm2m_ctx *ctx)
 	sock_nfds++;
 
 	return 0;
+}
+
+static void lwm2m_socket_update(struct lwm2m_ctx *ctx)
+{
+	for (int i = 0; i < sock_nfds; i++) {
+		if (sock_ctx[i] != ctx) {
+			continue;
+		}
+		sock_fds[i].fd = ctx->sock_fd;
+		return;
+	}
+
 }
 
 void lwm2m_socket_del(struct lwm2m_ctx *ctx)
@@ -5716,7 +5773,7 @@ static void check_notifications(struct lwm2m_ctx *ctx,
 			continue;
 		}
 		/* Check That There is not pending process and client is registred */
-		if (obs->active_tx_operation || !lwm2m_rd_client_is_registred(ctx)) {
+		if (obs->active_tx_operation) {
 			continue;
 		}
 
@@ -5798,6 +5855,18 @@ static void socket_loop(void)
 	int32_t timeout, next_retransmit;
 
 	while (1) {
+		/* Check is Thread Suspend Requested */
+		if (suspend_engine_thread) {
+#if defined(CONFIG_LWM2M_RD_CLIENT_SUPPORT)
+			lwm2m_rd_client_pause();
+#endif
+			suspend_engine_thread = false;
+			k_thread_suspend(engine_thread_id);
+#if defined(CONFIG_LWM2M_RD_CLIENT_SUPPORT)
+			lwm2m_rd_client_resume();
+#endif
+		}
+
 		timestamp = k_uptime_get();
 		timeout = lwm2m_engine_service(timestamp);
 
@@ -5814,7 +5883,8 @@ static void socket_loop(void)
 					timeout = next_retransmit;
 				}
 			}
-			if (sys_slist_is_empty(&sock_ctx[i]->pending_sends)) {
+			if (sys_slist_is_empty(&sock_ctx[i]->pending_sends) &&
+			    lwm2m_rd_client_is_registred(sock_ctx[i])) {
 				check_notifications(sock_ctx[i], timestamp);
 			}
 		}
@@ -5834,6 +5904,11 @@ static void socket_loop(void)
 		}
 
 		for (i = 0; i < sock_nfds; i++) {
+
+			if (sock_ctx[i]->sock_fd < 0) {
+				continue;
+			}
+
 			if ((sock_fds[i].revents & POLLERR) ||
 			    (sock_fds[i].revents & POLLNVAL) ||
 			    (sock_fds[i].revents & POLLHUP)) {
@@ -5933,21 +6008,10 @@ int lwm2m_socket_start(struct lwm2m_ctx *client_ctx)
 
 	if (client_ctx->sock_fd < 0) {
 		allocate_socket = true;
-#if defined(CONFIG_LWM2M_DTLS_SUPPORT)
-		if (client_ctx->use_dtls) {
-			client_ctx->sock_fd = socket(client_ctx->remote_addr.sa_family, SOCK_DGRAM,
-						     IPPROTO_DTLS_1_2);
-		} else
-#endif /* CONFIG_LWM2M_DTLS_SUPPORT */
-		{
-			client_ctx->sock_fd =
-				socket(client_ctx->remote_addr.sa_family, SOCK_DGRAM, IPPROTO_UDP);
+		ret = lwm2m_open_socket(client_ctx);
+		if (ret) {
+			return ret;
 		}
-	}
-
-	if (client_ctx->sock_fd < 0) {
-		LOG_ERR("Failed to create socket: %d", errno);
-		return -errno;
 	}
 
 #if defined(CONFIG_LWM2M_DTLS_SUPPORT)
@@ -6182,6 +6246,45 @@ int lwm2m_engine_start(struct lwm2m_ctx *client_ctx)
 	return lwm2m_socket_start(client_ctx);
 }
 
+int lwm2m_engine_pause(void)
+{
+	char buffer[32];
+	const char *str;
+	str = k_thread_state_str(engine_thread_id, buffer, sizeof(buffer));
+	if (suspend_engine_thread || !strcmp(str, "suspended")) {
+		LOG_WRN("Engine Already at Suspended");
+		return 0;
+	}
+
+	suspend_engine_thread = true;
+
+	while(strcmp(str, "suspended")) {
+		k_msleep(10);
+		str = k_thread_state_str(engine_thread_id, buffer, sizeof(buffer));	
+	}
+	LOG_INF("LWM2M engine thread paused (%s) ", str);
+	return 0;
+	
+}
+
+int lwm2m_engine_resume(void)
+{
+	char buffer[32];
+	const char *str;
+	
+	str = k_thread_state_str(engine_thread_id, buffer, sizeof(buffer));
+	if (strcmp(str, "suspended")) {
+		LOG_WRN("LWM2M engine thread state not ok for resume %s", str);
+		return -EPERM;
+	}
+
+	k_thread_resume(engine_thread_id);
+	str = k_thread_state_str(engine_thread_id, buffer, sizeof(buffer));
+	LOG_INF("LWM2M engine thread resume (%s)", str);
+	return 0;
+	
+}
+
 static int lwm2m_engine_init(const struct device *dev)
 {
 	int i;
@@ -6193,7 +6296,7 @@ static int lwm2m_engine_init(const struct device *dev)
 	(void)memset(block1_contexts, 0, sizeof(block1_contexts));
 
 	/* start sock receive thread */
-	k_thread_create(&engine_thread_data, &engine_thread_stack[0],
+	engine_thread_id = k_thread_create(&engine_thread_data, &engine_thread_stack[0],
 			K_KERNEL_STACK_SIZEOF(engine_thread_stack),
 			(k_thread_entry_t)socket_loop, NULL, NULL, NULL,
 			THREAD_PRIORITY, 0, K_NO_WAIT);
