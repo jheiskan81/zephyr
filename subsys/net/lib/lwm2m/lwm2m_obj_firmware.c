@@ -13,13 +13,20 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <zephyr/init.h>
 
 #include "lwm2m_object.h"
 #include "lwm2m_engine.h"
 
 #define FIRMWARE_VERSION_MAJOR 1
+#if defined(CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1)
+#define FIRMWARE_VERSION_MINOR 1
+#define FIRMWARE_MAX_ID				14
+#else
 #define FIRMWARE_VERSION_MINOR 0
+#define FIRMWARE_MAX_ID				10
+#endif /* CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1 */
 
 #if defined(CONFIG_LWM2M_FIRMWARE_UPDATE_OBJ_SUPPORT_MULTIPLE)
 #define MAX_INSTANCE_COUNT CONFIG_LWM2M_FIRMWARE_UPDATE_OBJ_INSTANCE_COUNT
@@ -38,7 +45,10 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #define FIRMWARE_UPDATE_PROTO_SUPPORT_ID	8
 #define FIRMWARE_UPDATE_DELIV_METHOD_ID		9
 
-#define FIRMWARE_MAX_ID				10
+#define FIRMWARE_CANCEL_ID                      10
+#define FIRMWARE_SEVERITY_ID                    11	/* unused */
+#define FIRMWARE_LAST_STATE_CHANGE_TIME_ID      12
+#define FIRMWARE_MAXIMUM_DEFERRED_PERIOD_ID     13	/* unused */
 
 #define DELIVERY_METHOD_PULL_ONLY		0
 #define DELIVERY_METHOD_PUSH_ONLY		1
@@ -58,6 +68,7 @@ static uint8_t update_state[MAX_INSTANCE_COUNT];
 static uint8_t update_result[MAX_INSTANCE_COUNT];
 static uint8_t delivery_method[MAX_INSTANCE_COUNT];
 static char package_uri[MAX_INSTANCE_COUNT][PACKAGE_URI_LEN];
+static time_t last_change[MAX_INSTANCE_COUNT];
 
 /* A varying number of firmware object exists */
 static struct lwm2m_engine_obj firmware;
@@ -70,7 +81,11 @@ static struct lwm2m_engine_obj_field fields[] = {
 	OBJ_FIELD_DATA(FIRMWARE_PACKAGE_NAME_ID, R_OPT, STRING),
 	OBJ_FIELD_DATA(FIRMWARE_PACKAGE_VERSION_ID, R_OPT, STRING),
 	OBJ_FIELD_DATA(FIRMWARE_UPDATE_PROTO_SUPPORT_ID, R_OPT, U8),
-	OBJ_FIELD_DATA(FIRMWARE_UPDATE_DELIV_METHOD_ID, R, U8)
+	OBJ_FIELD_DATA(FIRMWARE_UPDATE_DELIV_METHOD_ID, R, U8),
+#if defined(CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1)
+	OBJ_FIELD_EXECUTE(FIRMWARE_CANCEL_ID),
+	OBJ_FIELD(FIRMWARE_LAST_STATE_CHANGE_TIME_ID, R, TIME),
+#endif /* CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1 */
 };
 
 static struct lwm2m_engine_obj_inst inst[MAX_INSTANCE_COUNT];
@@ -84,6 +99,8 @@ static lwm2m_engine_user_cb_t cancel_cb[MAX_INSTANCE_COUNT];
 #ifdef CONFIG_LWM2M_FIRMWARE_UPDATE_PULL_SUPPORT
 extern int lwm2m_firmware_start_transfer(uint16_t obj_inst_id, char *package_uri);
 #endif
+
+static int cancel(uint16_t id, uint8_t *args, uint16_t args_len);
 
 uint8_t lwm2m_firmware_get_update_state_inst(uint16_t obj_inst_id)
 {
@@ -141,6 +158,14 @@ void lwm2m_firmware_set_update_state_inst(uint16_t obj_inst_id, uint8_t state)
 	path.res_id = FIRMWARE_STATE_ID;
 
 	lwm2m_set_u8(&path, state);
+	if (IS_ENABLED(CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1)) {
+		time_t now;
+
+		now = time(NULL);
+		path.res_id = FIRMWARE_LAST_STATE_CHANGE_TIME_ID;
+		lwm2m_set_time(&path, now);
+	}
+
 	lwm2m_registry_unlock();
 
 	LOG_DBG("Update state = %d", state);
@@ -249,17 +274,28 @@ static int package_write_cb(uint16_t obj_inst_id, uint16_t res_id,
 		 * make sure it fail after timeout
 		 */
 		lwm2m_firmware_set_update_state_inst(obj_inst_id, STATE_DOWNLOADING);
-	} else if (state == STATE_DOWNLOADED) {
-		if (data_len == 0U || (data_len == 1U && data[0] == '\0')) {
-			/* reset to state idle and result default */
-			lwm2m_firmware_set_update_result_inst(obj_inst_id, RESULT_DEFAULT);
-			cancel_callback = lwm2m_firmware_get_cancel_cb_inst(obj_inst_id);
-			if (cancel_callback) {
-				ret = cancel_callback(obj_inst_id);
+	} else if (data_len == 0U || (data_len == 1U && data[0] == '\0')) {
+
+		if (IS_ENABLED(CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1)) {
+			if (state != STATE_DOWNLOADED && state != STATE_DOWNLOADING) {
+				return -EPERM;
 			}
-			LOG_DBG("Update canceled by writing %d bytes", data_len);
-			return 0;
+		} else {
+			if (state != STATE_DOWNLOADED) {
+				return -EPERM;
+			}
 		}
+
+		/* reset to state idle and result default */
+		lwm2m_firmware_set_update_result_inst(obj_inst_id, RESULT_DEFAULT);
+		cancel_callback = lwm2m_firmware_get_cancel_cb_inst(obj_inst_id);
+		if (cancel_callback) {
+			ret = cancel_callback(obj_inst_id);
+		}
+		LOG_DBG("Update canceled by writing %d bytes", data_len);
+		return 0;
+
+	} else if (state == STATE_DOWNLOADED) {
 		LOG_WRN("Download has already completed");
 		return -EPERM;
 	} else if (state != STATE_DOWNLOADING) {
@@ -460,6 +496,13 @@ static struct lwm2m_engine_obj_inst *firmware_create(uint16_t obj_inst_id)
 			  res_inst[index], j, &(delivery_method[index]),
 			  sizeof(delivery_method[index]));
 
+	if (IS_ENABLED(CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1)) {
+		INIT_OBJ_RES_EXECUTE(FIRMWARE_CANCEL_ID, res[index], i, cancel);
+		INIT_OBJ_RES_DATA(FIRMWARE_LAST_STATE_CHANGE_TIME_ID, res[index], i,
+				  res_inst[index], j, &last_change[index],
+				  sizeof(time_t));
+	}
+
 	inst[index].resources = res[index];
 	inst[index].resource_count = i;
 
@@ -476,6 +519,12 @@ static int lwm2m_firmware_init(void)
 	firmware.obj_id = LWM2M_OBJECT_FIRMWARE_ID;
 	firmware.version_major = FIRMWARE_VERSION_MAJOR;
 	firmware.version_minor = FIRMWARE_VERSION_MINOR;
+	if (IS_ENABLED(CONFIG_LWM2M_FIRMWARE_OBJECT_VERSION_1_1)) {
+		/* Force to register Object version 1.1 to server */
+		firmware.is_core = false;
+	} else {
+		firmware.is_core = true;
+	}
 	firmware.is_core = true;
 	firmware.fields = fields;
 	firmware.field_count = ARRAY_SIZE(fields);
@@ -504,6 +553,23 @@ static int lwm2m_firmware_init(void)
 	}
 
 	return ret;
+}
+
+static int cancel(uint16_t id, uint8_t *args, uint16_t args_len)
+{
+	uint8_t state;
+
+	LOG_DBG("Cancelling FOTA id %d", id);
+	state = lwm2m_firmware_get_update_state();
+	if (state != STATE_DOWNLOADED && state != STATE_DOWNLOADING) {
+		LOG_ERR("State other than downloaded or downloading: %d", state);
+		return -EPERM;
+	}
+
+	/* Writing empty URI will trigger cancelling */
+	lwm2m_set_opaque(&LWM2M_OBJ(LWM2M_OBJECT_FIRMWARE_ID, id, FIRMWARE_PACKAGE_URI_ID),
+			 NULL, 0);
+	return 0;
 }
 
 SYS_INIT(lwm2m_firmware_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
